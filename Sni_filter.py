@@ -135,6 +135,9 @@ def show_statistics(processing_time: float, good_count: int, total_links: int, g
     
     print(f"\033[92msubWhitelist.txt → {unique_good} уникальных ссылок\033[0m")
     print(f"\033[91msubNo.txt        → {total_links - good_count} ссылок\033[0m\n")
+    
+    # Вот твоя серая подпись
+    print("\033[90mgithub.com/xLyouLx\033[0m")
 
 def start_sni_filter():
     script_path = os.path.dirname(os.path.abspath(__file__))
