@@ -20,3 +20,6 @@
 6. Всё остальное (включая ключи без SNI) → в **subNo.txt**
 7. Старые версии subWhitelist.txt и subNo.txt сохраняются с датой в папку `backups/`
 8. В конце выводит красивый цветной отчёт с топами accepted / rejected доменов
+
+```bash
+pip install colorama
