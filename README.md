@@ -1,4 +1,3 @@
-```markdown
 # SNI-sub-filter
 
 Фильтрует ссылки vless/vmess/trojan/ss/hysteria2/tuic по SNI/host, оставляя только те, чей домен совпадает с твоим белым списком.
