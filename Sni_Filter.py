@@ -1,3 +1,25 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import subprocess
+import sys
+import importlib
+REQUIRED_MODULES = ['requests', 'colorama']
+
+def ensure_modules(modules):
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            print(f"модуль '{module}' не найден. устанавливаю...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", module])
+                print(f"модуль '{module}' успешно установлен.")
+            except Exception as e:
+                print(f"ошибка при установке '{module}': {e}")
+                print("пожалуйста, установите модуль вручную командой:")
+                print(f"  {sys.executable} -m pip install {module}")
+                sys.exit(1)
 import re
 import os
 import time
