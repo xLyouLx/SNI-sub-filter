@@ -40,14 +40,18 @@ if os.name == 'nt':
     except ImportError:
         pass
 
+# Guard: scheme must not be preceded by another scheme's letters,
+# otherwise 'ss://' matches inside 'vless://' and 'vmess://'
+_SCHEME_GUARD = r'(?<![A-Za-z0-9+.\-])'
 LINK_PATTERNS = [
-    re.compile(r'(vmess://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(vless://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(trojan://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(ss://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(hysteria2://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(hy2://[^\s"]+)', re.IGNORECASE),
-    re.compile(r'(tuic://[^\s"]+)', re.IGNORECASE)
+    re.compile(_SCHEME_GUARD + r'(vmess://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(vless://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(trojan://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(ss://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(hysteria2://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(hy2://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(hysteria://[^\s"]+)', re.IGNORECASE),
+    re.compile(_SCHEME_GUARD + r'(tuic://[^\s"]+)', re.IGNORECASE)
 ]
 
 SNI_PARAMS = ['sni=', 'host=', 'servername=', 'peer=']
@@ -58,6 +62,37 @@ def normalize_uuid(u):    return u.strip().lower().replace('{','').replace('}','
 def normalize_server(s):  return s[1:-1] if s and s.startswith('[') and s.endswith(']') else (s.strip() if s else "")
 def normalize_port(p):    return str(p).strip() if p else "443"
 def normalize_param(v):   return v.strip().lower() if v else ""
+
+UUID_REGEX = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+def split_host_port(server_part):
+    """'host:port' | '[ipv6]:port' | 'host' -> (host, port)."""
+    server_part = (server_part or "").strip().rstrip('/')
+    if server_part.startswith('['):
+        i = server_part.find(']')
+        if i != -1:
+            rest = server_part[i + 1:]
+            return server_part[1:i], (rest[1:] if rest.startswith(':') else "")
+    if ':' in server_part:
+        host, _, port = server_part.rpartition(':')
+        if host:
+            return host, port
+    return server_part, ""
+
+def try_b64_decode(s):
+    """Строгий base64 (обычный и urlsafe) с автопаддингом; None при ошибке."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    pad = '=' * (-len(s) % 4)
+    try:
+        return base64.b64decode(s + pad, validate=True).decode('utf-8')
+    except Exception:
+        pass
+    try:
+        return base64.b64decode(s.replace('-', '+').replace('_', '/') + pad, validate=True).decode('utf-8')
+    except Exception:
+        return None
 
 def extract_individual_links(line: str) -> list[str]:
     links = []
@@ -114,21 +149,10 @@ def parse_vless(link):
         name = unquote(link.split('#', 1)[1]) if '#' in link else ""
         main = link.split('#')[0]
         addr_part, param_part = main.split('?', 1) if '?' in main else (main, "")
-        uuid, server_part = main.split('@', 1) if '@' in addr_part else ("", addr_part)
+        uuid, server_part = addr_part.split('@', 1) if '@' in addr_part else ("", addr_part)
         uuid = normalize_uuid(uuid)
 
-        server, port = "", "443"
-        if ':' in server_part:
-            if server_part.startswith('['):
-                i = server_part.index(']')
-                server = server_part[1:i]
-                pstr = server_part[i+1:]
-                if pstr.startswith(':'): port = pstr[1:]
-            else:
-                parts = server_part.split(':')
-                server = parts[0]
-                if len(parts) > 1: port = parts[1]
-
+        server, port = split_host_port(server_part)
         server = normalize_server(server)
         port = normalize_port(port)
 
@@ -161,10 +185,44 @@ def parse_vless(link):
 def parse_vmess(link):
     if not link.startswith('vmess://'): return None
     try:
-        encoded = link[8:]
-        padding = 4 - len(encoded) % 4
-        if padding != 4: encoded += '=' * padding
-        config = json.loads(base64.b64decode(encoded).decode('utf-8'))
+        body = link[8:]
+        name = unquote(body.split('#', 1)[1]) if '#' in body else ""
+        main = body.split('#', 1)[0]
+        head = main.split('?', 1)[0]
+
+        # Текстовый AEAD-формат: vmess://uuid@host:port?params#name
+        if '@' in head:
+            addr_part, param_part = main.split('?', 1) if '?' in main else (main, "")
+            uuid, server_part = addr_part.split('@', 1) if '@' in addr_part else ("", addr_part)
+            uuid = normalize_uuid(uuid)
+            server, port = split_host_port(server_part)
+            server = normalize_server(server)
+            port = normalize_port(port)
+
+            params = parse_qs(param_part)
+            sec  = normalize_param(params.get('security', [''])[0])
+            typ  = normalize_param(params.get('type',     [''])[0])
+            host = normalize_param(params.get('host',     [''])[0])
+            path = normalize_param(params.get('path',     [''])[0])
+            sni  = normalize_param(params.get('sni',      [''])[0])
+
+            key_parts = [server, port, uuid, sec, typ]
+            if host: key_parts.append(host)
+            if path: key_parts.append(path)
+            key = ':'.join(key_parts)
+
+            return {
+                'type': 'vmess', 'protocol': 'vmess', 'server': server, 'port': port,
+                'uuid': uuid, 'security': sec, 'type_param': typ, 'host': host,
+                'path': path, 'sni': sni, 'net': typ, 'ps': name,
+                'key': key, 'original': link
+            }
+
+        # Классический формат: vmess://base64(JSON)
+        decoded = try_b64_decode(body)
+        if not decoded:
+            return None
+        config = json.loads(decoded)
 
         server = normalize_server(config.get('add', ''))
         port   = normalize_port(config.get('port', '443'))
@@ -199,18 +257,7 @@ def parse_trojan(link):
         addr_part, param_part = main.split('?', 1) if '?' in main else (main, "")
         password, server_part = addr_part.split('@', 1) if '@' in addr_part else ("", addr_part)
 
-        server, port = "", "443"
-        if ':' in server_part:
-            if server_part.startswith('['):
-                i = server_part.index(']')
-                server = server_part[1:i]
-                pstr = server_part[i+1:]
-                if pstr.startswith(':'): port = pstr[1:]
-            else:
-                parts = server_part.split(':')
-                server = parts[0]
-                if len(parts) > 1: port = parts[1]
-
+        server, port = split_host_port(server_part)
         server = normalize_server(server)
         port = normalize_port(port)
 
@@ -251,25 +298,34 @@ def parse_ss(link):
             sni = normalize_param(params.get('sni', [''])[0])
         else:
             sni = ""
-        if re.match(r'^[A-Za-z0-9+/=]+$', content):
-            try:
-                decoded = base64.b64decode(content + '=' * (-len(content) % 4)).decode('utf-8', errors='ignore')
-                if '@' in decoded:
-                    method_pass, server_port = decoded.split('@', 1)
-                    method, password = method_pass.split(':', 1) if ':' in method_pass else (method_pass, '')
-                    server, port = server_port.split(':', 1) if ':' in server_port else (server_port, '443')
-                else:
-                    return None
-            except:
-                return None
-        else:
-            if '@' in content:
-                method_pass, server_port = content.split('@', 1)
-                method, password = method_pass.split(':', 1) if ':' in method_pass else (method_pass, '')
-                server, port = server_port.split(':', 1) if ':' in server_port else (server_port, '443')
-            else:
-                return None
 
+        if any(x in content.lower() for x in ['uuid=', 'flow=', 'reality', 'pbk=', 'sid=']):
+            return None
+
+        if '@' not in content:
+            # Старый формат: целиком base64(method:pass@host:port)
+            decoded = try_b64_decode(content)
+            if not decoded or '@' not in decoded:
+                return None
+            content = decoded
+
+        method_pass, server_port = content.rsplit('@', 1)
+        method_pass = unquote(method_pass)
+
+        if ':' in method_pass:
+            method, password = method_pass.split(':', 1)
+        else:
+            # SIP002: base64(method:password) перед '@'
+            decoded = try_b64_decode(method_pass)
+            if not decoded or ':' not in decoded:
+                return None
+            method, password = decoded.split(':', 1)
+
+        # UUID в роли метода — это не SS, а vless/vmess, переименованные в ss://
+        if UUID_REGEX.match(method):
+            return None
+
+        server, port = split_host_port(server_port)
         server = normalize_server(server)
         port = normalize_port(port)
         key = f"ss:{server}:{port}:{method}:{password}"
@@ -286,10 +342,10 @@ def parse_hysteria2(link):
         return None
     try:
         if link.startswith('hysteria://'):
-            link = 'hysteria2://' + link[10:]
-        if link.startswith('hy2://'):
-            link = 'hysteria2://' + link[5:]
-        content = link[12:]
+            link = 'hysteria2://' + link[len('hysteria://'):]
+        elif link.startswith('hy2://'):
+            link = 'hysteria2://' + link[len('hy2://'):]
+        content = link[len('hysteria2://'):]
         if '#' in content:
             content, name = content.split('#', 1)
             name = unquote(name)
@@ -303,10 +359,10 @@ def parse_hysteria2(link):
             base = content
             sni = ""
         if '@' in base:
-            auth, server_port = base.split('@', 1)
+            auth, server_port = base.rsplit('@', 1)
         else:
             auth, server_port = "", base
-        server, port = server_port.split(':', 1) if ':' in server_port else (server_port, '443')
+        server, port = split_host_port(server_port)
         server = normalize_server(server)
         port = normalize_port(port)
         key = f"hysteria2:{server}:{port}:{sni}" if sni else f"hysteria2:{server}:{port}"
@@ -334,19 +390,14 @@ def parse_tuic(link):
             params = {}
         if '@' not in base:
             return None
-        auth_host = base.split('@')
-        auth = auth_host[0]
-        host_port = auth_host[1]
+        auth, host_port = base.rsplit('@', 1)
         if ':' in auth:
             uuid, password = auth.split(':', 1)
         else:
             uuid, password = auth, ""
-        if ':' in host_port:
-            host, port = host_port.split(':', 1)
-        else:
-            host, port = host_port, "443"
+        server, port = split_host_port(host_port)
         uuid = normalize_uuid(uuid)
-        server = normalize_server(host)
+        server = normalize_server(server)
         port = normalize_port(port)
         sni = normalize_param(params.get('sni', [''])[0])
         security = normalize_param(params.get('security', [''])[0])
@@ -369,7 +420,7 @@ def parse_link(link: str):
     if link.startswith('vmess://'):     return parse_vmess(link)
     if link.startswith('trojan://'):    return parse_trojan(link)
     if link.startswith('ss://'):        return parse_ss(link)
-    if link.startswith('hysteria2://') or link.startswith('hy2://') or link.startswith('hysteria://'):
+    if link.startswith(('hysteria2://', 'hy2://', 'hysteria://')):
         return parse_hysteria2(link)
     if link.startswith('tuic://'):      return parse_tuic(link)
     return None
